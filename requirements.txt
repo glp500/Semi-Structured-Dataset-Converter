@@ -1,0 +1,5 @@
+streamlit>=1.33.0      # web‑app framework
+PyMuPDF>=1.23.3        # PDF text extraction (imported as fitz)
+pdfplumber>=0.10.3     # optional but imported in script for table extraction
+openai>=1.13.3         # modern OpenAI Python SDK (v1.x)
+pandas>=2.2.0          # CSV handling and display
