@@ -125,7 +125,7 @@ if uploaded_pdf is not None:
             try:
                 # ----- first call: contextual summary as an instructional prompt
                 ctx_resp = openai.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="o4-mini-2025-04-16",
                     messages=[
                         {
                             "role": "system",
@@ -140,11 +140,11 @@ if uploaded_pdf is not None:
                             )
                         },
                     ],
-                    temperature=0.3,
+                    temperature=1.0,
                 )
                 # ----- second call: infer table relationships
                 rel_resp = openai.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="o4-mini-2025-04-16",
                     messages=[
                         {
                             "role": "system",
@@ -159,7 +159,7 @@ if uploaded_pdf is not None:
                             )
                         },
                     ],
-                    temperature=0.3,
+                    temperature=1.0,
                 )
                 st.session_state["suggested_context"] = ctx_resp.choices[0].message.content.strip()
                 st.session_state["suggested_relationships"] = rel_resp.choices[0].message.content.strip()
