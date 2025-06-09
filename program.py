@@ -1,11 +1,34 @@
 import os
 import re
 import io
-import fitz                   # PyMuPDF
+import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
-import openai
+import google.generativeai as genai
 from io import BytesIO, StringIO
+import csv
+import json
+import time
+
+# ------------------------------------------------------------
+# Helper: an improved error handler for API calls
+# ------------------------------------------------------------
+def handle_api_error(e, step_name="API call"):
+    """
+    Provides specific user feedback for common, fixable errors.
+    """
+    st.error(f"An error occurred during the {step_name}. The process cannot continue.")
+    st.error(f"Error details: {e}")
+    if "Illegal header value" in str(e):
+        st.warning(
+            "This error often points to a problem with your Python libraries. "
+            "Please try stopping the app and running the following command in your terminal to fix it:\n\n"
+            "```\n"
+            "pip install --upgrade --force-reinstall google-generativeai google-auth grpcio\n"
+            "```"
+        )
+    st.stop()
+
 
 # ------------------------------------------------------------
 # Helper: chunk long text so each piece stays within model limits
@@ -16,334 +39,483 @@ def chunk_text(text: str, max_chars: int = 12000) -> list[str]:
     attempting to break at whitespace for cleaner splits.
     """
     chunks = []
-    while len(text) > max_chars:
-        # find the last newline or space before the limit
-        split_idx = text.rfind("\n", 0, max_chars)
-        if split_idx == -1:
-            split_idx = text.rfind(" ", 0, max_chars)
-        if split_idx == -1:
-            split_idx = max_chars  # fallback hard split
-        chunks.append(text[:split_idx].strip())
-        text = text[split_idx:].lstrip()
-    if text.strip():
-        chunks.append(text.strip())
-    return chunks
+    current_pos = 0
+    while current_pos < len(text):
+        end_pos = current_pos + max_chars
+        if end_pos >= len(text):
+            chunk_to_add = text[current_pos:].strip()
+            if chunk_to_add:
+                 chunks.append(chunk_to_add)
+            break
+        
+        split_idx = text.rfind("\n", current_pos, end_pos)
+        if split_idx == -1 or split_idx < current_pos:
+            split_idx = text.rfind(" ", current_pos, end_pos)
+        
+        if split_idx == -1 or split_idx < current_pos:
+            split_idx = end_pos -1
+        
+        if split_idx < current_pos :
+             split_idx = end_pos -1
+             if split_idx < current_pos:
+                 split_idx = len(text) -1
+
+        chunk_to_add = text[current_pos : split_idx + 1].strip()
+        if chunk_to_add:
+            chunks.append(chunk_to_add)
+        current_pos = split_idx + 1
+        
+    return [chunk for chunk in chunks if chunk]
+
 
 # ------------------------------------------------------------
-# 2. Streamlit page config
+# Helper: robust CSV reader
 # ------------------------------------------------------------
-st.set_page_config(page_title="PDF ➜ Relational CSVs", layout="wide")
-st.title("📄 PDF Tables → Relational CSVs (GPT‑powered)")
+def robust_read_csv(csv_text: str, has_header: bool = True) -> pd.DataFrame:
+    if not csv_text.strip():
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(StringIO(csv_text), header=0 if has_header else None, on_bad_lines='skip', engine='python')
+        return df
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+    except (pd.errors.ParserError, csv.Error) as err:
+        st.warning(f"Pandas/CSV ParserError, attempting manual fallback: {err}. Content snippet: '{csv_text[:200]}'")
+        lines = csv_text.strip().splitlines()
+        if not lines:
+            return pd.DataFrame()
+
+        try:
+            try:
+                 dialect = csv.Sniffer().sniff(lines[0] if len(lines)>0 else csv_text, delimiters=',;\t|')
+                 reader = csv.reader(lines, dialect=dialect)
+            except csv.Error:
+                 reader = csv.reader(lines)
+            all_rows = list(reader)
+        except Exception as reader_err:
+            st.warning(f"CSV reader failed during fallback: {reader_err}")
+            return pd.DataFrame()
+
+        if not all_rows:
+            return pd.DataFrame()
+
+        header_row_data = []
+        data_rows_data = []
+
+        if has_header:
+            if all_rows:
+                header_row_data = all_rows[0]
+                data_rows_data = all_rows[1:]
+            else: return pd.DataFrame()
+        else:
+            header_row_data = [f"col_{i}" for i in range(len(all_rows[0]))] if all_rows and all_rows[0] else []
+            data_rows_data = all_rows
+        
+        if not header_row_data and not data_rows_data: return pd.DataFrame()
+        if not header_row_data and data_rows_data :
+            header_row_data = [f"col_{i}" for i in range(len(data_rows_data[0]))] if data_rows_data and data_rows_data[0] else []
+
+        col_cnt = len(header_row_data)
+        if col_cnt == 0 and data_rows_data:
+             if data_rows_data[0]:
+                 col_cnt = len(data_rows_data[0])
+                 if not header_row_data: header_row_data = [f"col_{i}" for i in range(col_cnt)]
+             else: return pd.DataFrame()
+        elif col_cnt == 0 and not data_rows_data:
+            return pd.DataFrame(columns=header_row_data)
+
+        fixed_rows = []
+        for r in data_rows_data:
+            if not r: continue
+            if len(r) == col_cnt: fixed_rows.append(r)
+            elif len(r) > col_cnt and col_cnt > 0 :
+                merged_last = ",".join(r[col_cnt-1:])
+                fixed_rows.append(r[:col_cnt-1] + [merged_last])
+            elif len(r) < col_cnt:
+                fixed_rows.append(r + [""] * (col_cnt - len(r)))
+
+        try:
+            if fixed_rows: return pd.DataFrame(fixed_rows, columns=header_row_data)
+            elif header_row_data: return pd.DataFrame(columns=header_row_data)
+            else: return pd.DataFrame()
+        except Exception as final_err:
+            st.warning(f"Could not fully repair CSV after manual parsing: {final_err}")
+            return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Robust CSV reading failed with unexpected error: {e}. CSV Text: {csv_text[:200]}")
+        return pd.DataFrame()
 
 # ------------------------------------------------------------
-# 3. Sidebar – user inputs
+# Streamlit page config
 # ------------------------------------------------------------
+st.set_page_config(page_title="PDF ➜ Relational CSVs (Gemini)", layout="wide")
+st.title("📄 PDF Tables → Relational CSVs (Gemini-powered)")
 
+# ------------------------------------------------------------
+# Sidebar – user inputs
+# ------------------------------------------------------------
 st.sidebar.header("Settings")
 
-# (OpenAI key) --------------------------------------------------------------
 api_key_input = st.sidebar.text_input(
-    "OpenAI API Key",
+    "Google AI API Key",
     type="password",
-    placeholder="sk-...",
-    help="Enter your OpenAI key; it is used only for this session."
+    placeholder="Enter your Google AI API Key...",
+    help="Enter your Google AI API key; it is used only for this session."
 )
-if api_key_input:
-    openai.api_key = api_key_input.strip()
-elif "OPENAI_API_KEY" in os.environ:
-    openai.api_key = os.environ["OPENAI_API_KEY"]
-else:
-    openai.api_key = None
 
-# (a) How many CSV tables to create
+google_api_key = None
+if api_key_input:
+    google_api_key = api_key_input.strip()
+elif "GOOGLE_API_KEY" in os.environ:
+    google_api_key = os.environ["GOOGLE_API_KEY"]
+
+if google_api_key:
+    try:
+        genai.configure(api_key=google_api_key)
+    except Exception as e:
+        st.sidebar.error(f"Failed to configure Google AI API: {e}")
+        google_api_key = None # Invalidate if configuration fails
+else:
+    if "uploaded_pdf" in st.session_state and st.session_state.uploaded_pdf is not None :
+         st.sidebar.warning("Google AI API Key not found. Please enter it to proceed.")
+
+
 num_tables = st.sidebar.number_input(
     "Number of CSV tables to generate",
     min_value=1, max_value=5, value=1, step=1
 )
 
-# (b) Names for each table
 table_names = []
 for i in range(1, num_tables + 1):
     name = st.sidebar.text_input(f"Name for Table {i}", value=f"Table{i}")
     table_names.append(name.strip() or f"Table{i}")
 
-# (c) Relationships description (optional)
-relationships_desc = st.sidebar.text_area(
-    "Describe relationships (PK/FK) between tables (optional)",
-    placeholder="e.g., Table2.InvoiceID references Table1.ID"
+st.sidebar.markdown("---")
+st.sidebar.subheader("Few-Shot Example (Optional)")
+example_pdf_file = st.sidebar.file_uploader(
+    "1. Example PDF Table",
+    type=["pdf"],
+    help="Upload a single-page PDF showing an example of the table structure."
 )
-
-# (d) Extra context / business rules
-user_context = st.sidebar.text_area(
-    "Extra context about the data (recommended)",
-    placeholder=(
-        "Describe what the PDF contains, meaning of fields, date formats, "
-        "business rules, etc."
-    ),
-    height=150
+example_json_file = st.sidebar.file_uploader(
+    "2. Example Target JSON",
+    type=["json"],
+    help="Upload the ideal JSON output corresponding to the example PDF."
 )
-
-# (e) Example CSVs for format guidance (optional – you may upload up to `num_tables`)
 example_csv_files = st.sidebar.file_uploader(
-    "Example CSVs (optional, one per target table – upload in table order)",
+    "3. Example Target CSVs",
     type=["csv"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
+    help="Upload the final CSV file(s) that should be generated from the example JSON (upload in table order)."
 )
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("Additional Context")
+additional_context_file = st.sidebar.file_uploader(
+    "Additional Context File (optional)",
+    type=['txt', 'md', 'json', 'py', 'html', 'pdf'],
+    help="Upload a file (including PDF) with extra context, syntax rules, or data structure descriptions."
+)
+
+
 # ------------------------------------------------------------
-# 4. Main panel – PDF upload & processing
+# Main panel – PDF upload & processing
 # ------------------------------------------------------------
-uploaded_pdf = st.file_uploader("Upload PDF containing tables", type=["pdf"])
+uploaded_pdf = st.file_uploader("Upload PDF containing tables", type=["pdf"], key="uploaded_pdf_widget")
 
 if uploaded_pdf is not None:
-    # Verify API key is set
-    if not openai.api_key:
-        st.error("Please enter your OpenAI API key in the sidebar.")
-        st.stop()
-    # ---- 4A. Extract text from PDF ----
-    try:
-        doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
-        # extract page texts
-        pages_text = [page.get_text() for page in doc]
-        doc.close()
-        pdf_text_full = "\n".join(pages_text)
-    except Exception as e:
-        st.error(f"Failed to read PDF: {e}")
+    # State management to reset everything for a new file
+    if "last_uploaded_pdf_name" not in st.session_state or st.session_state.last_uploaded_pdf_name != uploaded_pdf.name:
+        st.session_state.last_uploaded_pdf_name = uploaded_pdf.name
+        keys_to_clear = [
+            'pages_text', 'additional_context_text', 'suggestions_just_generated',
+            'suggested_context', 'suggested_relationships', 'csv_tables_generated',
+            'generated_json_data'
+        ]
+        for key in keys_to_clear:
+            if key in st.session_state:
+                del st.session_state[key]
+
+    if not google_api_key:
+        st.error("Please enter your Google AI API key in the sidebar.")
         st.stop()
 
-    # Chunk the combined text
-    chunks = chunk_text(pdf_text_full, max_chars=12000)
-    st.success(f"PDF text extracted and split into {len(chunks)} chunk(s).")
+    if 'pages_text' not in st.session_state:
+        try:
+            with st.spinner("Extracting text from PDF..."):
+                doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
+                st.session_state.pages_text = [page.get_text() for page in doc]
+                doc.close()
+            st.success(f"PDF text extracted from {len(st.session_state.pages_text)} page(s).")
+        except Exception as e:
+            st.error(f"Failed to read PDF: {e}")
+            st.stop()
+    
+    pages_text = st.session_state.pages_text
 
-    # ---- 4B. Auto‑generate suggested context & relationships -----------------
-    if (
-        "suggested_context" not in st.session_state
-        or "suggested_relationships" not in st.session_state
-        or st.session_state.get("context_source_name") != uploaded_pdf.name
-    ):
-        with st.spinner("Analyzing tables to generate context…"):
+    if 'additional_context_text' not in st.session_state:
+        if additional_context_file is not None:
+            raw_context_text = ""
             try:
-                # ----- first call: contextual summary as an instructional prompt
-                ctx_resp = openai.chat.completions.create(
-                    model="o4-mini-2025-04-16",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You write concise instructional prompts for downstream data‑extraction models."
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "Based on the following extracted table data, write a short instructional prompt "
-                                "that describes the overall context of the data so another model can use it:\n\n"
-                                f"{chunks[0][:8000]}"
-                            )
-                        },
-                    ],
-                    temperature=1.0,
-                )
-                # ----- second call: infer table relationships
-                rel_resp = openai.chat.completions.create(
-                    model="o4-mini-2025-04-16",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You infer relational structure between tables."
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "Using the same extracted table data, describe plausible relationships (e.g., primary/foreign "
-                                "keys, hierarchical links) between tables that would help build a relational dataset:\n\n"
-                                f"{chunks[0][:8000]}"
-                            )
-                        },
-                    ],
-                    temperature=1.0,
-                )
-                st.session_state["suggested_context"] = ctx_resp.choices[0].message.content.strip()
-                st.session_state["suggested_relationships"] = rel_resp.choices[0].message.content.strip()
-                st.session_state["context_source_name"] = uploaded_pdf.name
+                if additional_context_file.name.lower().endswith('.pdf'):
+                    with st.spinner(f"Extracting text from context PDF: {additional_context_file.name}..."):
+                        context_pdf_stream = BytesIO(additional_context_file.getvalue())
+                        with fitz.open(stream=context_pdf_stream, filetype="pdf") as doc:
+                            context_pages = [page.get_text() for page in doc]
+                        raw_context_text = "\n".join(context_pages)
+                else:
+                    raw_context_text = additional_context_file.getvalue().decode("utf-8")
+                
+                CONTEXT_SUMMARY_THRESHOLD = 15000
+                if len(raw_context_text) > CONTEXT_SUMMARY_THRESHOLD:
+                    with st.spinner(f"Context file is large, summarizing it first..."):
+                        context_chunks = chunk_text(raw_context_text)
+                        summaries = []
+                        model_summarizer = genai.GenerativeModel(model_name='gemini-2.5-pro-preview-06-05')
+                        
+                        for i, chunk in enumerate(context_chunks):
+                            st.info(f"Summarizing context chunk {i+1}/{len(context_chunks)}...")
+                            try:
+                                prompt = f"Summarize the key information, rules, and syntax from this piece of technical documentation:\n\n{chunk}"
+                                resp = model_summarizer.generate_content(prompt)
+                                summaries.append(resp.text)
+                                time.sleep(1) 
+                            except Exception as e:
+                                handle_api_error(e, f"context summarization on chunk {i+1}")
+                        
+                        if summaries:
+                            st.info("Creating final summary of context...")
+                            try:
+                                final_summary_prompt = "Consolidate the following summaries into a single, coherent set of instructions and context:\n\n" + "\n---\n".join(summaries)
+                                final_resp = model_summarizer.generate_content(final_summary_prompt)
+                                st.session_state.additional_context_text = final_resp.text
+                                st.success("Large context file has been summarized.")
+                            except Exception as e:
+                                handle_api_error(e, "final context summarization")
+                        else:
+                            st.session_state.additional_context_text = ""
+                else:
+                    st.session_state.additional_context_text = raw_context_text
+                
             except Exception as e:
-                st.warning(f"Auto‑context generation failed: {e}")
-                st.session_state["suggested_context"] = ""
-                st.session_state["suggested_relationships"] = ""
+                st.warning(f"Could not read or process the additional context file: {e}")
+                st.session_state.additional_context_text = ""
+        else:
+            st.session_state.additional_context_text = ""
+            
+    additional_context_text = st.session_state.get('additional_context_text', "")
 
-    suggested_context = st.session_state.get("suggested_context", "")
-    suggested_relationships = st.session_state.get("suggested_relationships", "")
+    example_pdf_text = ""
+    if example_pdf_file:
+        try:
+            with fitz.open(stream=example_pdf_file.read(), filetype="pdf") as doc:
+                if doc: example_pdf_text = "\n".join([page.get_text() for page in doc])
+                else: st.sidebar.warning("Example PDF is empty.")
+        except Exception as e:
+            st.sidebar.error(f"Failed to read example PDF: {e}")
 
-    # ---- Editable expanders --------------------------------------------------
-    with st.expander("🧠 Suggested Context (editable)", expanded=False):
-        edited_context = st.text_area(
-            "Context prompt for downstream model",
-            value=suggested_context,
-            height=150,
-            key="edited_context"
-        )
+    example_json_text = ""
+    if example_json_file:
+        try:
+            example_json_text = example_json_file.getvalue().decode("utf-8")
+        except Exception as e:
+            st.sidebar.error(f"Failed to read example JSON: {e}")
 
-    with st.expander("🔗 Suggested Table Relationships (editable)", expanded=False):
-        edited_relationships = st.text_area(
-            "Relationships description",
-            value=suggested_relationships,
-            height=150,
-            key="edited_relationships"
-        )
+    if (
+        pages_text and not st.session_state.get('suggestions_just_generated')
+    ):
+        with st.spinner("Analyzing tables with Gemini to generate context (runs once per file)..."):
+            try:
+                model_context_gen = genai.GenerativeModel(model_name='gemini-2.5-pro-preview-06-05')
+                generation_config_context = genai.types.GenerationConfig(max_output_tokens=4096, temperature=0.3)
+                first_page_for_context = pages_text[0][:8000]
+                
+                ctx_prompt = f"Based on the following extracted table data, write a detailed instructional prompt describing the overall context, data types, and business rules so another model can use it. Be thorough.\n\n{first_page_for_context}"
+                ctx_resp = model_context_gen.generate_content(ctx_prompt, generation_config=generation_config_context)
+                
+                rel_prompt = f"Using the same extracted table data, describe in detail the plausible PK/FK relationships, hierarchical links, and relational schema that would help build a relational dataset. Be thorough.\n\n{first_page_for_context}"
+                rel_resp = model_context_gen.generate_content(rel_prompt, generation_config=generation_config_context)
+                
+                st.session_state["suggested_context"] = ctx_resp.text.strip()
+                st.session_state["suggested_relationships"] = rel_resp.text.strip()
+                st.session_state.suggestions_just_generated = True
+                st.rerun()
+            except Exception as e:
+                handle_api_error(e, "auto-context generation")
 
-    # ---- 4C. Parse example CSVs if provided ----
+    st.markdown("---")
+    st.subheader("Step 1: Review and Edit Context")
+    expand_suggestions = st.session_state.get('suggestions_just_generated', False)
+
+    with st.expander("🧠 Suggested Context (editable)", expanded=expand_suggestions):
+        edited_context = st.text_area("Context prompt", value=st.session_state.get("suggested_context", ""), height=200, key="edited_context_area", help="This text is automatically generated. You can edit it before generating the final CSVs.")
+    with st.expander("🔗 Suggested Table Relationships (editable)", expanded=expand_suggestions):
+        edited_relationships = st.text_area("Relationships description", value=st.session_state.get("suggested_relationships", ""), height=200, key="edited_relationships_area", help="This text is automatically generated. You can edit it before generating the final CSVs.")
+    user_context = st.text_area("Your Additional Context (manual input)", placeholder=("Add any other context here..."), height=150)
+
     example_snippets = []
     if example_csv_files:
-        for file_idx, csv_file in enumerate(example_csv_files, start=1):
+        for i, csv_file in enumerate(example_csv_files):
             try:
-                df_ex = pd.read_csv(csv_file)
+                csv_file.seek(0)
+                df_ex = pd.read_csv(BytesIO(csv_file.getvalue()))
                 headers = list(df_ex.columns)
                 first_row = df_ex.iloc[0].tolist() if not df_ex.empty else []
-                snippet = (
-                    f"Example CSV for Table {file_idx} headers: {headers}\n"
-                    f"Example CSV for Table {file_idx} first row: {first_row}\n"
-                )
-                example_snippets.append(snippet)
+                if i < len(table_names):
+                    table_name = table_names[i]
+                    snippet = f"Example for Table '{table_name}':\nHeaders: {headers}\nFirst row: {first_row}\n"
+                    example_snippets.append(snippet)
             except Exception as e:
-                st.warning(f"Could not read example CSV {csv_file.name}: {e}")
+                st.sidebar.warning(f"Could not read example CSV {csv_file.name}: {e}")
 
-    # ---- 4C. Build prompt ----
-    schema_desc_lines = [
-        f"Table {idx}: {name}" for idx, name in enumerate(table_names, start=1)
-    ]
-    prompt_parts = [
-        f"Extract structured data from the PDF text into {num_tables} CSV tables.",
-        "Table schema:",
-        *schema_desc_lines
-    ]
-    if user_context:
-        prompt_parts.append("User‑supplied context: " + user_context.strip())
-    if edited_context:
-        prompt_parts.append("System‑suggested context: " + edited_context.strip())
-    if edited_relationships:
-        prompt_parts.append("System‑suggested relationships: " + edited_relationships.strip())
-    if example_snippets:
-        prompt_parts.append("Example CSV formats:")
-        prompt_parts.extend(s.strip() for s in example_snippets)
-    prompt_parts.append("PDF text follows:\n" + pdf_text_full.strip())
+    st.markdown("---")
+    st.subheader("Step 2: Generate Final CSVs")
+    
+    if st.button("Generate CSV tables", key="generate_csv_button"):
+        
+        few_shot_for_json_prompt = ""
+        if example_pdf_text and example_json_text:
+            few_shot_for_json_prompt = f"""Here is a one-shot example to guide you.
 
-    user_prompt = "\n\n".join(prompt_parts)
+--- START OF EXAMPLE ---
+**EXAMPLE INPUT (TEXT FROM A PDF PAGE):**
+```text
+{example_pdf_text}
 
-    # Show prompt preview (optional)
-    with st.expander("Prompt preview"):
-        st.write(user_prompt[:800] + ("…" if len(user_prompt) > 800 else ""))
+EXAMPLE OUTPUT (THE DESIRED JSON):
+{example_json_text}
+--- END OF EXAMPLE ---
+Now, apply the same logic and structure from the example to the real input below.
+"""
+# --- PART 1: Place this entire section INSIDE the if st.button(...) block ---
 
-    # ---- 4D. Call OpenAI ----
-    if st.button("Generate CSV tables"):
-        # we will collect raw CSV content from each chunk and concatenate per table
-        accumulated_tables = {i: [] for i in range(1, num_tables + 1)}
+        all_pages_text = "\n".join(pages_text)
+        text_chunks = chunk_text(all_pages_text)
 
-        with st.spinner("Processing chunks with OpenAI…"):
-            for chunk_idx, chunk_text_part in enumerate(chunks, start=1):
-                # Build a chunk‑specific prompt (include header only in first chunk)
-                chunk_prompt = (
-                    user_prompt.replace("PDF text follows:", f"Chunk {chunk_idx}/{len(chunks)} PDF text:") +
-                    "\n\n" + chunk_text_part
-                )
-                if chunk_idx > 1:
-                    chunk_prompt += (
-                        "\n\nIMPORTANT: For this chunk output rows ONLY (no header rows) "
-                        "for each CSV section."
-                    )
+        st.session_state.generated_json_data = None
+        st.session_state.csv_tables_generated = None
+
+        with st.spinner(f"Asking Gemini to convert PDF text to structured JSON... (processing {len(text_chunks)} chunk(s))"):
+            all_json_responses = []
+            model_json = genai.GenerativeModel(model_name='gemini-2.5-pro-preview-06-05')
+            generation_config_json = genai.types.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.1
+            )
+            
+            for i, chunk in enumerate(text_chunks):
+                st.info(f"Processing chunk {i+1}/{len(text_chunks)}...")
+                prompt_parts = [
+                    few_shot_for_json_prompt,
+                    "You are a data extraction expert. Convert the following text extracted from a PDF into a single, well-structured JSON object.",
+                    "The JSON should represent all the tables and their relationships as described in the context.",
+                    f"CONTEXT:\n{edited_context}\n\nRELATIONSHIPS:\n{edited_relationships}\n\nADDITIONAL CONTEXT:\n{additional_context_text}\n\nMANUAL CONTEXT:\n{user_context}",
+                    "Ensure the JSON is valid and accurately captures all data points, including hierarchical structures.",
+                    f"PDF TEXT CHUNK:\n```text\n{chunk}\n```"
+                ]
                 try:
-                    resp = openai.chat.completions.create(
-                        model="o4-mini-2025-04-16",
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You convert unstructured text into multiple CSV tables. "
-                                    "For each table output, start with 'CSV X:' (X = table number), "
-                                    "then raw CSV data. Do not add explanations."
-                                ),
-                            },
-                            {"role": "user", "content": chunk_prompt},
-                        ],
-                        temperature=1.0,
-                    )
-                    raw_output = resp.choices[0].message.content.strip()
+                    final_prompt = "\n".join(filter(None, prompt_parts))
+                    response = model_json.generate_content(final_prompt, generation_config=generation_config_json)
+                    all_json_responses.append(response.text)
+                    time.sleep(1)
                 except Exception as e:
-                    st.error(f"OpenAI error (chunk {chunk_idx}): {e}")
-                    st.stop()
+                    handle_api_error(e, f"JSON generation on chunk {i+1}")
+            
+            if len(all_json_responses) > 1:
+                st.warning("Multiple text chunks were processed. Attempting to merge JSON outputs. Review the result carefully.")
+                merged_data = {}
+                for json_str in all_json_responses:
+                    try:
+                        data = json.loads(json_str)
+                        if isinstance(data, dict):
+                            merged_data.update(data)
+                        else:
+                            st.warning(f"Cannot merge JSON response of type {type(data)}. Appending as string.")
+                    except json.JSONDecodeError:
+                        st.error(f"Failed to decode a JSON chunk. The chunk will be skipped:\n{json_str[:500]}")
+                final_json_text = json.dumps(merged_data, indent=2)
+            elif all_json_responses:
+                final_json_text = all_json_responses[0]
+            else:
+                st.error("No JSON was generated from the PDF text.")
+                st.stop()
+                
+            st.session_state.generated_json_data = final_json_text
+            st.success("Successfully generated structured JSON from PDF text.")
 
-                # ---- Split output into CSV sections for this chunk ----
-                sections = re.split(r"(?=CSV\s*\d+:)", raw_output)
-                for sec in sections:
-                    sec = sec.strip()
-                    if not sec:
-                        continue
-                    m = re.match(r"CSV\s*(\d+):", sec)
-                    if not m:
-                        continue
-                    idx = int(m.group(1))
-                    if idx < 1 or idx > num_tables:
-                        continue
-                    csv_content = sec.split(":", 1)[1].lstrip()
-                    accumulated_tables[idx].append(csv_content)
+# --- PART 2: Place this section AFTER the if st.button(...) block, at the same indentation level ---
 
-        # ------------------------------------------------------------
-        # Helper: robust CSV reader to handle inconsistent row lengths
-        # ------------------------------------------------------------
-        import csv
-        def robust_read_csv(csv_text: str) -> pd.DataFrame:
-            """
-            Attempt to read CSV text. If pandas raises a tokenization error due to
-            inconsistent row lengths, fix rows to the modal column count.
-            """
+    if 'generated_json_data' in st.session_state and st.session_state.generated_json_data:
+        st.subheader("View Generated JSON")
+        st.json(st.session_state.generated_json_data)
+        
+        with st.spinner("Asking Gemini to convert JSON to final CSV tables..."):
             try:
-                return pd.read_csv(StringIO(csv_text))
-            except Exception as err:
-                # fallback: manual parsing
-                lines = csv_text.splitlines()
-                if not lines:
-                    return pd.DataFrame()
-                reader = csv.reader(lines)
-                rows = list(reader)
-                header = rows[0]
-                col_cnt = len(header)
+                model_csv = genai.GenerativeModel(model_name='gemini-2.5-pro-preview-06-05')
+                generation_config_csv = genai.types.GenerationConfig(temperature=0.0)
 
-                # if some rows have different length, try to fix
-                fixed_rows = []
-                for r in rows[1:]:
-                    if len(r) == col_cnt:
-                        fixed_rows.append(r)
-                    elif len(r) > col_cnt:
-                        # merge extra columns into last field
-                        merged_last = ",".join(r[col_cnt-1:])
-                        fixed_rows.append(r[:col_cnt-1] + [merged_last])
-                    else:  # len(r) < col_cnt
-                        fixed_rows.append(r + [""] * (col_cnt - len(r)))
-                try:
-                    return pd.DataFrame(fixed_rows, columns=header)
-                except Exception:
-                    # give up and return empty df
-                    st.warning(f"Could not fully repair CSV: {err}")
-                    return pd.DataFrame()
+                csv_prompt_parts = [
+                    "You are a data transformation expert. Your task is to convert the provided JSON data into multiple, distinct, relational CSV tables as specified.",
+                    f"You must generate exactly {num_tables} CSV table(s).",
+                    f"The required table names are: {', '.join(table_names)}.",
+                    "Use the provided context, relationships, and CSV examples to determine the correct columns and data for each table.",
+                    f"CONTEXT:\n{edited_context}\n\nRELATIONSHIPS:\n{edited_relationships}\n\nADDITIONAL CONTEXT:\n{additional_context_text}\n\nMANUAL CONTEXT:\n{user_context}",
+                    "CSV EXAMPLES:\n" + "\n".join(example_snippets) if example_snippets else "No CSV examples provided.",
+                    "Follow these output instructions precisely:",
+                    "1. For each table, start with a header line: `=== START OF TABLE: [TableName] ===`",
+                    "2. Then, provide the CSV data for that table, with a header row and comma-separated values.",
+                    "3. End each table's data with a footer line: `=== END OF TABLE: [TableName] ===`",
+                    "4. Ensure the data is properly normalized across the tables as per the relational schema description.",
+                    f"JSON DATA TO TRANSFORM:\n```json\n{st.session_state.generated_json_data}\n```"
+                ]
 
-        # ---- Combine accumulated CSV parts and parse into DataFrames ----
-        csv_tables = {}
-        for idx in range(1, num_tables + 1):
-            combined_csv = "\n".join(accumulated_tables[idx]).strip()
-            if not combined_csv:
-                csv_tables[idx] = pd.DataFrame()
-                continue
-            df_read = robust_read_csv(combined_csv)
-            csv_tables[idx] = df_read
+                final_csv_prompt = "\n".join(filter(None, csv_prompt_parts))
+                csv_response = model_csv.generate_content(final_csv_prompt, generation_config=generation_config_csv)
+                
+                table_pattern = re.compile(r"=== START OF TABLE: (.*?) ===\n(.*?)\n=== END OF TABLE: \1 ===", re.DOTALL)
+                matches = table_pattern.findall(csv_response.text)
 
-        # ---- 4F. Display and download each table ----
-        for i in range(1, num_tables + 1):
-            df_show = csv_tables.get(i, pd.DataFrame())
-            with st.expander(f"CSV {i}: {table_names[i-1]}", expanded=(i == 1)):
-                st.dataframe(df_show, use_container_width=True)
-                st.download_button(
-                    label=f"Download {table_names[i-1]}.csv",
-                    data=df_show.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{table_names[i-1]}.csv",
-                    mime="text/csv",
-                    key=f"csv_download_{i}"
-                )
-else:
-    st.info("Upload a PDF file to begin.")
+                if not matches:
+                    st.error("The model did not return any data in the expected format. The generation failed.")
+                    st.code(csv_response.text, language='text')
+                else:
+                    generated_tables = {}
+                    for name, csv_data in matches:
+                        df = robust_read_csv(csv_data)
+                        if not df.empty:
+                            generated_tables[name.strip()] = df
+                    
+                    st.session_state.csv_tables_generated = generated_tables
+                    st.success(f"Successfully generated {len(generated_tables)} CSV table(s).")
+            
+            except Exception as e:
+                handle_api_error(e, "CSV generation from JSON")
+
+    if 'csv_tables_generated' in st.session_state and st.session_state.csv_tables_generated:
+        st.markdown("---")
+        st.subheader("Step 3: Review and Download Generated CSVs")
+        
+        generated_tables_data = st.session_state.csv_tables_generated
+        
+        if generated_tables_data:
+            tab_titles = list(generated_tables_data.keys())
+            tabs = st.tabs(tab_titles)
+            
+            for i, table_name in enumerate(tab_titles):
+                with tabs[i]:
+                    st.markdown(f"#### {table_name}")
+                    df_to_display = generated_tables_data[table_name]
+                    st.dataframe(df_to_display)
+                    
+                    csv_buffer = StringIO()
+                    df_to_display.to_csv(csv_buffer, index=False)
+                    st.download_button(
+                        label=f"Download {table_name}.csv",
+                        data=csv_buffer.getvalue(),
+                        file_name=f"{table_name}.csv",
+                        mime="text/csv",
+                        key=f"download_{table_name}"
+                    )
+        else:
+            st.warning("No tables were generated or data was empty after processing.")
